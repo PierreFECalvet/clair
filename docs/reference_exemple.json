@@ -1,0 +1,118 @@
+{
+ "version": 1,
+ "nom": "Exemple minimal (à remplacer par 40 à 60 pages réelles)",
+ "pages": [
+  {
+   "version_id": "v-ex-1",
+   "url": "https://exemple.test/depeche",
+   "type_page": "actualite",
+   "texte": "Le périphérique parisien sera immobilisé du 1er au 31 août 2026.\n\nLe PDG de Acme est Alice Martin depuis 2024.",
+   "unites": [
+    {
+     "id": "ex-u1",
+     "span": [
+      0,
+      64
+     ],
+     "classe": "annonce",
+     "type": "information_source",
+     "faits": [
+      {
+       "span": [
+        41,
+        63
+       ],
+       "sujet": "périphérique parisien",
+       "predicat": "immobilise",
+       "objet": "du 1er au 31 août 2026"
+      }
+     ]
+    },
+    {
+     "id": "ex-u2",
+     "span": [
+      66,
+      110
+     ],
+     "classe": "etat_courant",
+     "type": "information_source",
+     "faits": [
+      {
+       "span": [
+        85,
+        97
+       ],
+       "sujet": "Acme",
+       "predicat": "pdg",
+       "objet": "Alice Martin"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "version_id": "v-ex-2",
+   "url": "https://exemple.test/guide",
+   "type_page": "guide_pratique",
+   "texte": "Le PDG de Acme est Bob Durand depuis 2026.\n\nNous pensons que ce produit est le meilleur.",
+   "unites": [
+    {
+     "id": "ex-u3",
+     "span": [
+      0,
+      42
+     ],
+     "classe": "etat_courant",
+     "type": "information_source",
+     "faits": [
+      {
+       "span": [
+        19,
+        29
+       ],
+       "sujet": "Acme",
+       "predicat": "pdg",
+       "objet": "Bob Durand"
+      }
+     ]
+    },
+    {
+     "id": "ex-u4",
+     "span": [
+      44,
+      88
+     ],
+     "classe": "usage",
+     "type": "opinion",
+     "faits": []
+    }
+   ]
+  }
+ ],
+ "paires": [
+  {
+   "a": "ex-u2",
+   "b": "ex-u3",
+   "relation": "contradiction"
+  }
+ ],
+ "groupes": [
+  {
+   "id": "ex-g1",
+   "unites": [
+    "ex-u2",
+    "ex-u3"
+   ],
+   "page_parente": "v-ex-2"
+  }
+ ],
+ "grappes": [
+  {
+   "id": "ex-c1",
+   "pages": [
+    "v-ex-1",
+    "v-ex-2"
+   ]
+  }
+ ]
+}

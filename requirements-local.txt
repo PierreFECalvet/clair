@@ -1,0 +1,29 @@
+# Moteurs locaux optionnels de la chaine M1-M6.
+# L'application fonctionne sans aucun de ces paquets (replis par regles, LLM ou API).
+# Installation : installer_modeles.cmd (Windows) ou
+#   py -3 -m pip install -r requirements-local.txt
+#   py -3 -m spacy download fr_core_news_lg
+# Les modeles Hugging Face sont telecharges au premier usage (ou par installer_modeles.cmd).
+
+# Segmentation, analyse syntaxique, NER de repli
+spacy>=3.7,<4
+
+# Segmentation SaT (alternative a spaCy, plus robuste sur la ponctuation web)
+wtpsplit>=2.1
+
+# NER zero-shot multilingue (urchade/gliner_multi-v2.1)
+gliner>=0.2.13
+
+# NLI mDeBERTa-v3 XNLI, perplexite (petit modele causal)
+torch>=2.2
+transformers>=4.44
+
+# Embeddings (Qwen3-Embedding-0.6B, bge-m3) et cross-encoder (bge-reranker-v2-m3)
+sentence-transformers>=3.1
+
+# Classifieur few-shot
+setfit>=1.1
+datasets>=2.19
+
+# Verification de presence des modeles dans le cache (sans telechargement)
+huggingface_hub>=0.24

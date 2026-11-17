@@ -1,0 +1,590 @@
+# Vérificateur d'obsolescence — Méthodologies
+2026-11-13 · 
+## Vue d'ensemble
+La chaîne compte six méthodologies qui se passent le relais par une base SQL commune. Chaque étape enrichit les mêmes objets (page, unité, fait, source) au lieu de produire des fichiers isolés. Le principe directeur : un LLM ne décide jamais seul, et rien n'entre en base sans ancrage dans un texte.
+La ligne du haut construit et qualifie le stock d'affirmations sans appel extérieur. La ligne du bas est la seule qui consomme des unités Ibou et du temps humain.
+### Principes transverses
+Hiérarchie des moyens. On essaie d'abord les règles et scripts déterministes. Viennent ensuite les modèles discriminatifs locaux (NER, NLI, classifieurs, embeddings, rerankers), puis un LLM local à sortie contrainte par schéma JSON. Un LLM ou un index tiers payant n'intervient qu'en dernier recours, sur les cas ambigus ou un échantillon de contrôle.
+Ancrage obligatoire. Toute unité et tout fait portent leur span (offsets de caractères) dans le texte source. Un fait sans span est soit rejeté, soit rangé dans une table d'hypothèses séparée, jamais mélangé aux faits extraits.
+Double passe. Toute sortie générative est revérifiée par un autre mécanisme : NLI (le texte implique-t-il le fait ?), contrôle de schéma, correspondance de chaînes sur les entités.
+Temps explicite. Chaque fait reçoit une date d'ancrage : date écrite dans la phrase, sinon date relative résolue, sinon date de mise à jour, sinon date de publication. L'obsolescence se calcule sur cet ancrage et sur la date du jour.
+Tout est rejouable. Version du modèle, du prompt, des seuils et date d'exécution sont stockées avec chaque sortie. On peut ainsi recalculer une étape sans refaire les précédentes.
+Coût mesuré. Chaque étape journalise son temps de calcul local, ses tokens et ses unités Ibou par page. C'est un critère d'évaluation au même titre que la qualité.
+### Modèle de données commun (SQLite)
+| 
+Table | 
+Contenu | 
+Alimentée par | 
+| 
+pages | 
+URL, titre, auteur, date de publication, date de mise à jour, texte nettoyé, hash SimHash | 
+M1 | 
+| 
+chunks | 
+Paragraphe, titre de section, offsets, contexte (titre + date) | 
+M1 | 
+| 
+units | 
+Unité d'information (proposition autoportante), span, date d'ancrage, classe d'obsolescence | 
+M1 | 
+| 
+entities | 
+Entité canonique, type, alias, identifiant externe éventuel | 
+M1 | 
+| 
+facts | 
+Triplet sujet-prédicat-objet, origine (explicite, inférence, externe), score NLI, unité parente | 
+M1 | 
+| 
+hypotheses | 
+Faits de connaissance externe et informations inconnues, jamais traités comme extraits | 
+M1 | 
+| 
+topic_membership | 
+Page ou unité × sujet × degré d'appartenance (fuzzy) | 
+M1 | 
+| 
+unit_groups | 
+Groupes d'unités équivalentes après déduplication, relations entre unités | 
+M1, M3 | 
+| 
+sources | 
+Source citée (URL, entité citée, type interne/externe), unité concernée | 
+M2, M3, M5 | 
+| 
+claim_types | 
+Typologie de l'affirmation et confiance | 
+M2 | 
+| 
+paternity | 
+Unité parente par groupe, critère décisif, propagation | 
+M3 | 
+| 
+queries | 
+Requête de vérification, unités couvertes, priorité, score d'humanité | 
+M4, M5 | 
+| 
+ibou_calls | 
+Requête, endpoint, JSON brut, en-têtes, unités consommées | 
+M5 | 
+| 
+evidence | 
+Page récupérée, date, passage, score de pertinence, verdict NLI | 
+M5 | 
+| 
+proposals | 
+Phrase avant et après, faits modifiés, sources, décision humaine | 
+M6 | 
+## M1 — Décomposer une page en unités puis en faits atomiques
+La décomposition se fait en deux niveaux distincts. L'unité d'information est une proposition autoportante en langue naturelle. Le fait atomique est un triplet normalisé tiré de cette unité. Le LLM local n'intervient qu'au niveau de l'unité, encadré par un ancrage obligatoire et une vérification NLI. Tout le reste est assuré par des scripts et des modèles non génératifs.
+### Étape 1 — Acquisition et métadonnées
+Extraction. Utiliser Trafilatura en sortie XML plutôt que texte, pour conserver les liens (<ref target>), les titres et les citations. Les liens sont indispensables à M2.
+Date et auteur. Ordre de confiance :
+JSON-LD schema.org (datePublished, dateModified, author) lu avec extruct ;
+métadonnées Trafilatura et htmldate ;
+date visible dans le texte. Ces deux champs vont dans pages et ne sont jamais filtrés.
+Métadonnées d'usage exclues dès cette étape : temps de lecture, boutons de partage, « à lire aussi », mentions de commentaires.
+### Étape 2 — Segmentation : la structure plutôt qu'un nombre de mots
+Le chunk à nombre fixe de mots, standard des approches scientifiques, coupe des phrases. Il sépare aussi une affirmation de son ancrage temporel ou de son sujet, posé deux phrases plus haut. On segmente donc par la structure :
+d'abord par section (Hn) et par paragraphe ;
+puis par phrase, avec spaCy fr_core_news_lg ou SaT (wtpsplit), plus robuste sur la ponctuation web.
+Chaque chunk embarque son contexte : titre de la page, titre de section et date de la page. C'est le principe du chunk contextualisé, qui réduit fortement les unités orphelines (« il », « cette mesure »).
+### Étape 3 — Résolution du contexte, sans LLM
+Coréférences. Pronoms et anaphores résolus avec coreferee (modèle spaCy, français supporté) ou une règle simple : « dernier sujet nominal du même paragraphe ». Le résultat est à évaluer.
+Expressions temporelles. « L'an dernier », « mardi », « depuis 2023 », « d'ici la fin de l'été » sont convertis en dates absolues par rapport à la date de publication, avec HeidelTime (règles, français supporté) ou dateparser complété de règles maison. C'est l'étape la plus rentable pour l'obsolescence : une date relative non résolue rend l'unité inexploitable.
+### Étape 4 — Unités d'information
+| 
+Option | 
+Principe | 
+Coût | 
+Risque d'hallucination | 
+Limite | 
+| 
+A. Règles syntaxiques | 
+Découpage des coordinations, relatives et appositions sur l'arbre de dépendances spaCy | 
+Quasi nul | 
+Nul (texte recopié) | 
+Rappel moyen, unités parfois mal formées | 
+| 
+B. Modèle « propositionizer » | 
+Seq2seq type Flan-T5 entraîné à réécrire un passage en propositions (Dense X Retrieval) | 
+Faible, GPU modeste | 
+Faible | 
+Entraîné en anglais : à tester ou affiner en français | 
+| 
+C. LLM local contraint | 
+Qwen3 via LM Studio, schéma JSON imposé, chaque unité doit citer son span exact | 
+Moyen (temps de calcul local) | 
+Moyen, contenu par l'ancrage et le NLI | 
+Lenteur sur gros corpus, d'où le ciblage décidé sur ContentKB | 
+| 
+D. LLM tiers | 
+Même consigne via API payante | 
+Élevé | 
+Faible à moyen | 
+Seulement pour construire le jeu de référence ou arbitrer | 
+Recommandation : A comme base de comparaison, C en production, B à benchmarker. Si B atteint la qualité de C en français, il le remplace : il est dix à cent fois plus rapide. D sert uniquement à annoter le jeu de test (voir Protocole d'évaluation).
+Consigne de C, à figer :
+une unité = un seul énoncé vérifiable ;
+l'unité est autoportante : sujet explicite, cadre temporel explicite ;
+elle reprend les mots du texte ;
+elle cite son span ;
+elle ne contient aucun ajout de connaissance.
+### Étape 5 — Faits atomiques (triplets)
+Entités. GLiNER (NER zero-shot multilingue, types définis librement : infrastructure, collectivité, événement, montant…). Canonicalisation par alias et, en option, rattachement à un identifiant Wikidata (dump local ou API gratuite).
+Relations. Deux options :
+le LLM local, contraint à une liste fermée de prédicats ;
+un extracteur de relations non génératif (GLiREL, mREBEL). La liste fermée est la clé : 30 à 60 prédicats (est_situé_à, date_de_début, a_pour_dirigeant, prix, statut…) rendent la déduplication et le filtrage déterministes. Un prédicat libre rend tout le reste flou.
+Origine des faits. explicite ou inférence_contextuelle uniquement. Les faits de type connaissance_externe de ton exemple (F3, F4 : gestion et propriété du périphérique) ne doivent pas être produits par l'extraction. C'est précisément là que naissent les hallucinations. Ils vont dans hypotheses, au même titre que unknown_information, et alimentent M4 comme questions, jamais comme faits.
+Garde-fou. Chaque fait est verbalisé (« La voie gauche fait partie du périphérique parisien ») puis soumis à un modèle NLI multilingue, avec l'unité ou la phrase source comme prémisse. Candidats : mDeBERTa-v3 XNLI ; MiniCheck, conçu pour ce contrôle mais surtout entraîné en anglais. Sous le seuil d'implication, le fait est rejeté. S'y ajoute une vérification que les entités du fait existent dans le span.
+### Étape 6 — Filtrer : obsolescible, immuable, sans intérêt
+Le classement se fait d'abord par prédicat, puis par classifieur pour le reste.
+| 
+Classe | 
+Exemples | 
+Traitement | 
+| 
+Immuable | 
+Auteur d'une œuvre, date de naissance, événement passé daté (« a eu lieu le »), définition | 
+Conservé, jamais vérifié pour l'obsolescence | 
+| 
+État courant | 
+Propriétaire, dirigeant, prix, taux, règle en vigueur, chiffre « actuel », statut | 
+Obsolescible, va en M2 | 
+| 
+Annonce ou prévision | 
+Événement futur daté (le périphérique en août 2026), projet, objectif | 
+Obsolescible, avec une date de péremption : après la date annoncée, l'unité change de nature (a-t-elle eu lieu ?) | 
+| 
+Métadonnée de page | 
+Date de publication, date de mise à jour, auteur | 
+Toujours conservée, sert d'ancrage | 
+| 
+Usage du contenu | 
+Temps de lecture, invitation à partager, sommaire | 
+Exclue | 
+Base. Une table prédicat → classe couvre l'essentiel une fois la liste fermée.
+Cas non couverts. Un classifieur few-shot (SetFit sur les embeddings, 10 à 20 exemples par classe) traite le reste. Il utilise comme indices le temps verbal (morphologie spaCy : futur, présent), la présence de dates et les marqueurs « actuellement », « désormais », « depuis ».
+### Étape 7 — Embeddings, sujets et fuzzy c-means
+Embeddings locaux. Qwen3-Embedding 0.6B, déjà adopté sur ContentKB, ou bge-m3 en comparaison. Unités et pages sont encodées avec leur contexte (titre + unité).
+Fuzzy c-means : le bon choix, avec une précaution. En haute dimension (1 024 dimensions), les degrés d'appartenance du FCM tendent à s'uniformiser autour de 1/c, et le « flou » devient du bruit. Deux réglages sont nécessaires :
+réduire d'abord à 10–50 dimensions par UMAP ou PCA ;
+garder un exposant de flou m bas (1,1 à 1,5). Le nombre de sujets c se choisit par indices de validité (Xie-Beni, coefficient de partition) plutôt qu'à l'œil. Bibliothèques : scikit-fuzzy ou fuzzy-c-means. Une page appartient à un sujet au-delà d'un seuil d'appartenance (par exemple 0,2), donc souvent à plusieurs.
+Alternative à évaluer. HDBSCAN avec vecteurs d'appartenance souple ne demande pas de fixer c et isole le bruit. C'est une bonne base de comparaison.
+Hiérarchie. Les sujets se calculent au niveau page. Les unités héritent des sujets de leur page, puis sont regroupées à l'intérieur de chaque sujet.
+### Étape 8 — Déduplication des unités
+Exacte sur triplets normalisés. Même entité canonique, même prédicat, même valeur normalisée : doublon certain, sans modèle.
+Candidats sémantiques. Plus proches voisins par cosinus (sqlite-vec ou FAISS) à l'intérieur d'un même sujet, au-dessus d'un seuil.
+Qualification de chaque paire par NLI dans les deux sens :
+implication mutuelle : équivalentes ;
+implication dans un seul sens : l'une précise l'autre ;
+contradiction : transmise à M3 ;
+aucune : sans rapport.
+Le LLM local ne tranche que les paires dans la zone grise du NLI, conformément au juge décidé sur ContentKB.
+Les doublons ne sont pas supprimés : ils sont regroupés dans unit_groups. M3 a besoin de savoir que la même affirmation vit sur plusieurs pages.
+## M2 — Identifier les sources et typer les affirmations non sourcées
+M2 s'applique aux seules unités obsolescibles sorties de M1. Elle répond à deux questions dans l'ordre : l'affirmation cite-t-elle une source ? Sinon, de quel type d'affirmation s'agit-il ? Tout se fait par règles et classifieurs locaux. Le LLM n'arbitre que les cas sous le seuil de confiance.
+### Étape 1 — Repérer les sources explicites
+Trois signaux, tous déterministes, sont rattachés à l'unité si l'indice tombe dans la même phrase. À défaut, le rattachement se fait au paragraphe, avec une confiance moindre.
+Liens. Les <ref target> conservés par Trafilatura. Un lien vers le même domaine devient une source interne, à vérifier en M3 : le lien pointe-t-il vers la page qui a la paternité ? Un lien vers un autre domaine devient une source externe.
+Attributions textuelles. Un lexique de marqueurs (« selon », « d'après », « a indiqué », « rapporte », « a annoncé », « dans un communiqué », « une étude de ») est croisé avec la NER sur les organisations et personnes. On obtient ainsi une source nommée sans lien, par exemple « selon l'Insee ».
+Appareil de citation. Notes de bas de page, bibliographie, encadré « Sources », légendes de graphiques.
+Chaque source est stockée avec son type (lien interne, lien externe, source nommée, note) et sa portée : la phrase, le paragraphe ou toute la page.
+### Étape 2 — Typer les affirmations sans source
+La typologie suit ta grille. Le classement se fait en cascade, du signal le plus fiable au moins fiable. La première règle qui s'applique avec une confiance suffisante l'emporte.
+| 
+Ordre | 
+Type | 
+Signaux principaux | 
+Suite donnée | 
+| 
+1 | 
+Information source (l'auteur fait foi) | 
+Page de type étude, enquête, analyse, décision ou expertise. Première personne méthodologique (« notre enquête », « nous avons interrogé »). Chiffres produits par l'auteur. Auteur identifié comme expert du domaine. | 
+Sourcée par la page elle-même. Datée par la date de publication. | 
+| 
+2 | 
+Opinion | 
+Modalités évaluatives, adjectifs appréciatifs, première personne d'avis, conditionnel de souhait, « il faut », rubrique tribune ou édito | 
+Ni vérifiée ni jugée. Exclue de la file de vérification. | 
+| 
+3 | 
+Interprétation | 
+Connecteurs inférentiels (« donc », « ce qui montre », « cela signifie », « on peut en déduire »). Liens de dépendance avec d'autres unités sourcées de la même page. | 
+Rattachée aux unités dont elle dépend. Son statut suit le leur, sans jugement sur la qualité de l'interprétation. | 
+| 
+4 | 
+Connaissance générale | 
+Sujet générique (« la poule »), présent gnomique, absence de date, de chiffre et d'entité spécifique | 
+Vérification de faible priorité | 
+| 
+5 | 
+Sans source | 
+Valeur par défaut, surtout avec chiffre, date, entité nommée ou état courant | 
+File de vérification (M4, M5) | 
+Outils pour la cascade :
+Type de page. Rubrique et fil d'Ariane, balisage schema.org (ScholarlyArticle, Report, OpinionNewsArticle), plus un classifieur SetFit sur le titre et le chapô. Ce signal est calculé une fois par page.
+Opinion. Un classifieur de subjectivité au niveau phrase. Les jeux et modèles de la tâche « subjectivity » de CheckThat! couvrent plusieurs langues. Sinon, SetFit affiné sur une centaine de phrases annotées sur le corpus.
+Interprétation. Les marqueurs de discours, plus un test simple : l'unité est-elle impliquée, au sens NLI, par la combinaison de deux autres unités de la page ? Si oui, c'est une interprétation de ces unités.
+Connaissance générale. C'est le type le plus fragile. Les heuristiques ci-dessus donnent un premier tri. Le LLM local ne tranche que les cas ambigus, en répondant à une question fermée : « Cette phrase énonce-t-elle un fait général, stable et largement connu, indépendant de toute date ? » Une connaissance générale réellement stable est le plus souvent déjà classée immuable en M1. Ce type reste donc marginal dans la file.
+### Étape 3 — Signaler les références internes manquantes
+Une unité sans source dont l'équivalent existe sur une autre page du site est un défaut de contextualisation. Le défaut existe qu'il soit volontaire ou non. M2 ne fait que poser le drapeau source_manquante ; c'est M3 qui retrouve la page d'origine. Ce drapeau devient une recommandation de lien interne, utile pour l'objectif de maillage.
+### Sortie
+Chaque unité reçoit :
+un statut de sourçage : sourcée_externe, sourcée_interne, auto-sourcée, dépendante, opinion, connaissance_générale ou sans_source ;
+un score de confiance ;
+la règle ou le modèle qui a décidé, pour l'audit.
+## M3 — Rapprocher les articles, attribuer la paternité, propager les sources
+Une même affirmation retrouvée sur plusieurs pages devient un point de maillage. Une seule page en a la paternité. On la désigne par un ordre strict :
+le sujet principal ;
+le nombre de sources ;
+la date de publication.
+La paternité fixe la circulation des sources. Le parent reçoit les sources des enfants qui l'améliorent, et les enfants héritent des sources du parent. Les contradictions sont traitées à part, selon leur chronologie.
+### Étape 1 — Trouver les voisins hors de la page d'origine
+Pour chaque unité, la recherche des candidats est hybride et exclut toujours page_id = page d'origine. Sans cette exclusion, l'unité se retrouve elle-même et ses reformulations voisines dans la même page.
+Filtre structurel. Même entité canonique en sujet du triplet, ou entités partagées. C'est la contrainte la plus forte et elle ne coûte rien.
+Filtre thématique. Pages partageant au moins un sujet fuzzy au-dessus du seuil, ce qui réduit l'espace de recherche.
+Similarité dense. Plus proches voisins par cosinus sur les embeddings d'unités contextualisées, au-dessus d'un seuil calibré.
+Réordonnancement. Un cross-encoder multilingue (famille bge-reranker-v2-m3) réordonne les candidats. Il est plus précis que le cosinus et reste local.
+### Étape 2 — Qualifier chaque paire
+Le NLI dans les deux sens donne la relation logique. La comparaison des dates d'ancrage donne la relation temporelle. Le croisement des deux fixe la conséquence.
+| 
+Relation logique | 
+Ancrage temporel | 
+Relation retenue | 
+Conséquence | 
+| 
+Implication mutuelle | 
+Indifférent | 
+Équivalence | 
+Même groupe, point de maillage | 
+| 
+Implication dans un seul sens | 
+Indifférent | 
+Précision : l'une approfondit l'autre | 
+Même groupe ; l'unité précise peut apporter des sources | 
+| 
+Contradiction, même cadre | 
+Une unité nettement plus récente | 
+Remplacement | 
+L'ancienne devient obsolète_historique | 
+| 
+Contradiction, même cadre | 
+Même période ou chronologie indéterminable | 
+Conflit | 
+Les deux deviennent remise_en_question et passent en vérification prioritaire | 
+| 
+Contradiction apparente, cadres différents | 
+Indifférent | 
+Faux conflit | 
+Aucune ; c'est une différence de portée, de lieu ou de période | 
+Le cadre est le quadruplet (sujet, prédicat, portée, période). « Le PDG de X est A », ancré en 2023, et « le PDG de X est B », ancré en 2025, ne se contredisent pas : c'est une succession. La première devient historique. Sans vérification du cadre, le NLI signale une contradiction à tort à chaque changement d'état. C'est le piège principal de cette étape.
+Le LLM local n'intervient que sur les paires dont le score NLI tombe dans la zone grise. Il répond à une question fermée : même cadre ou non, et laquelle est présentée comme la plus récente.
+### Étape 3 — Désigner la paternité
+Dans chaque groupe d'unités équivalentes ou liées par précision, on applique ton ordre de priorité de façon lexicographique : le critère suivant ne sert qu'en cas d'égalité sur le précédent.
+Sujet principal. Score de centralité de l'unité dans sa page, combinant trois mesures :
+la similarité entre l'unité et le titre + chapô ;
+la présence de l'entité ou du prédicat dans le titre ou un Hn ;
+la part des unités de la page qui en dépendent. Un écart de score sous un seuil compte comme une égalité.
+Nombre de sources. Les sources distinctes de M2, dédupliquées par domaine.
+Date de publication. La plus ancienne l'emporte.
+Égalité persistante. Arbitrage humain dans l'interface de revue.
+Le critère décisif est enregistré dans paternity. Il sert d'explication lors de la revue et permet de recalculer si l'ordre change.
+### Étape 4 — Propager les sources
+Vers le parent. Les sources des enfants qui corrigent, ajustent, précisent ou approfondissent l'affirmation sont ajoutées au parent, avec le type de contribution.
+Vers les enfants. Les enfants héritent des sources du parent, sources propagées comprises. Le marquage héritée_de distingue ces sources des sources propres.
+Lien manquant. Un enfant sans lien interne vers son parent produit une recommandation de lien interne, ancrée sur la phrase de l'unité. C'est la réponse au défaut de référence interne relevé en M2.
+### Étape 5 — Statut temporel de chaque unité
+| 
+Statut | 
+Définition | 
+Origine | 
+| 
+à_jour | 
+Aucune version plus récente ni conflit connu | 
+Par défaut | 
+| 
+obsolète_historique | 
+Présentée, contextualisée ou datée avant une version équivalente plus récente qui la contredit | 
+Remplacement (étape 2) | 
+| 
+remise_en_question | 
+Contredite sans antériorité établie | 
+Conflit (étape 2) | 
+| 
+périmée_par_date | 
+Annonce ou prévision dont la date est passée au regard de la date du jour | 
+Règle de M1 | 
+Le statut périmée_par_date découle directement de la date du jour. L'immobilisation annoncée du 1er au 31 août 2026 est périmée au 13 novembre 2026. La question à vérifier n'est plus « aura-t-elle lieu ? » mais « a-t-elle eu lieu, et comme annoncé ? ». L'unité basculera ensuite vers un fait immuable passé, ou sera corrigée.
+## M4 — Statuts finaux et requêtes de vérification
+Une fois les unités dédupliquées et les sources propagées, les versions à jour avec source passent en sourcée. Toutes les autres reçoivent à_vérifier et une requête de moteur de recherche. La requête ne se construit pas à partir du fait atomique, trop pointu pour ramener des résultats comparables. Elle part du groupe d'unités, de son cadre et des informations inconnues.
+### Statuts
+| 
+Statut | 
+Condition | 
+Requête | 
+| 
+sourcée | 
+Version à jour avec au moins une source propre ou héritée | 
+Non, sauf si la source est elle-même plus ancienne que la période visée | 
+| 
+à_vérifier | 
+Sans source, ou remise_en_question, ou périmée_par_date | 
+Oui | 
+| 
+à_vérifier_faible | 
+Connaissance générale | 
+Oui, priorité minimale | 
+| 
+non_vérifiable | 
+Opinion | 
+Non | 
+| 
+dépendante | 
+Interprétation | 
+Non ; suit le statut des unités dont elle dépend | 
+| 
+historique | 
+obsolète_historique | 
+Non ; conservée comme valeur d'archive | 
+### Construire la requête : du fait au cadre
+La génération se fait en quatre temps et par gabarits, le LLM n'intervenant qu'en reformulation.
+Regrouper. Une requête par cadre (entité + type d'événement ou d'état + période), pas par fait. Les huit faits de l'exemple du périphérique donnent une seule requête. Le budget d'unités Ibou est ainsi divisé d'autant.
+Recontextualiser.
+Nom complet des entités : « périphérique parisien », pas « E1 » ni « la voie ».
+Lieu explicite.
+Période élargie d'un cran : la voie gauche devient « le périphérique », du 1er au 31 août devient « en août 2026 ».
+Type d'événement généralisé : « immobilisation de la voie gauche » devient « fermetures ou modifications ». C'est cet élargissement qui ramène des pages comparables.
+Choisir le gabarit selon la classe du prédicat et selon la date du jour.
+État courant (dirigeant, prix, règle) : question ouverte qui ne présuppose pas la valeur. « Qui dirige X en 2026 ? » plutôt que « A dirige-t-il X ? ». Une question qui contient la valeur ramène surtout les pages qui la répètent, copies du site compris : c'est un biais de confirmation.
+Connaissance générale : question fermée simple. « Est-ce qu'une poule pond des œufs ? »
+Annonce dont la date n'est pas passée : futur. « Le périphérique parisien sera-t-il concerné par des fermetures en août 2026 ? »
+Annonce dont la date est passée (périmée_par_date) : passé. Au 13 novembre 2026, l'exemple devient « Le périphérique parisien a-t-il été fermé ou modifié en août 2026 ? Quelles voies et quelles dates ? ». Garder le futur ramènerait les annonces d'avant l'événement, pas son bilan.
+Ajouter les inconnues. Les entrées de unknown_information et les hypothèses de connaissance externe deviennent la seconde partie de la question, à raison d'une ou deux au maximum : dates précises, voies concernées. C'est la structure de ton exemple, et elle permet de compléter l'article en plus de le corriger.
+Pour une unité critique, on produit deux requêtes : la question ouverte neutre, puis une question de contrôle qui contient la valeur. Si les deux convergent vers des sources indépendantes, la confirmation est solide.
+### Contrôler l'aspect humain avant envoi
+Le contrôle passe par des règles, puis un score.
+Règles bloquantes.
+200 caractères maximum, limite de l'API Ibou ;
+4 à 30 mots ;
+aucun identifiant, underscore, nom de prédicat ni fragment de JSON ;
+une ou deux questions au plus ;
+accents présents ;
+pas de date au format ISO.
+Score de naturel.
+La perplexité d'un petit modèle de langue local sur la requête : une formulation artificielle se repère à sa perplexité anormale.
+Si un export GSC requêtes est disponible, la similarité de la requête avec les vraies requêtes du site. C'est la meilleure référence de « comme si c'était demandé par des humains ».
+Échec. Une seule reformulation par le LLM local, puis un nouveau contrôle. En cas de second échec, le gabarit brut est conservé et marqué pour revue.
+## M5 — Prioriser puis vérifier via Ibou
+Seules les unités critiques pour leur page sont vérifiées tout de suite. Les autres attendent dans une file « plus tard ». La vérification suit toujours le même circuit, chaque étape étant stockée :
+requête Ibou ;
+récupération des pages ;
+sélection des passages ;
+pertinence ;
+verdict ;
+réécriture des unités, avec leurs sources.
+### Étape 1 — Critique ou pas
+Un score simple, calculé sans LLM, décide entre « vérifier maintenant » et « plus tard ». Il reste binaire, comme demandé.
+| 
+Critère | 
+Mesure | 
+Effet | 
+| 
+Centralité dans la page | 
+Score « sujet principal » de M3 | 
+Fort | 
+| 
+Emplacement | 
+Titre, chapô, Hn, premier paragraphe | 
+Fort | 
+| 
+Classe du prédicat | 
+Date, montant, prix, règle, sécurité, santé, droit | 
+Fort | 
+| 
+Statut | 
+remise_en_question ou périmée_par_date | 
+Fort | 
+| 
+Ancienneté de l'ancrage | 
+Écart avec la date du jour, rapporté à la volatilité habituelle du prédicat (un prix vieillit plus vite qu'un siège social) | 
+Moyen | 
+| 
+Audience de la page | 
+Clics GSC si disponibles | 
+Moyen | 
+| 
+Couverture | 
+Nombre d'unités couvertes par la même requête | 
+Départage | 
+Le seuil de « critique » est fixé après étiquetage d'un échantillon : est-ce que l'erreur sur cette unité fausserait la page ?
+### Étape 2 — Appeler Ibou
+Paramètres. /v1/passage par défaut (3 unités), max_results à 10, 20 au maximum pour les requêtes critiques peu fructueuses.
+Stockage. Le JSON brut et les en-têtes sont stockés dans ibou_calls, dont X-Units-Remaining. Un cache par empreinte de requête évite de payer deux fois.
+Erreurs. Les 429 sont distinguées en lisant le corps (solde épuisé ou débit). La pause respecte Retry-After sur les 503. Sous un seuil d'unités restantes, la file s'arrête proprement.
+Requêtes de contrôle. La seconde requête d'une unité critique (M4) n'est envoyée que si la première est insuffisante ou ambiguë.
+### Étape 3 — Récupérer et filtrer les sources
+Récupération. Le HTML de chaque URL renvoyée est téléchargé. Trafilatura extrait le texte, et la date est lue dans l'ordre de M1 (JSON-LD, puis htmldate).
+Exclusion de la circularité. Sont écartés :
+le site audité lui-même ;
+ses quasi-copies, repérées par SimHash, la méthode déjà en place ;
+les pages dont le passage reprend l'unité presque mot pour mot (agrégateurs, reprises de dépêche) : elles comptent pour une seule source.
+Filtre temporel. Pour un état courant ou un bilan d'événement, une source n'est retenue que si sa date est postérieure ou contemporaine de la période visée. Une source datée d'avant l'annonce ne dit rien de son exécution.
+Poids de la source. Le domaine officiel ou primaire prime : administration, entreprise concernée, organisme statistique. On peut ajouter la Host Value / Trust de Babbar comme signal d'autorité, disponible via le connecteur.
+### Étape 4 — Sélectionner les passages et juger la pertinence
+Le passage renvoyé par Ibou est le point de départ. La page récupérée est redécoupée par la structure (M1) et ses passages sont réordonnés par cross-encoder face à la requête et à l'unité.
+Pertinence de la réponse à la question : le passage traite-t-il le même cadre (même entité, même période, même type d'événement) ? On vérifie la correspondance d'entités et de dates par règles, puis un seuil sur le score du reranker. Un passage hors cadre est écarté, même s'il est sémantiquement proche.
+### Étape 5 — Verdict
+Un NLI local compare chaque fait de l'unité à chaque passage retenu, avec trois issues : soutient, contredit, insuffisant. Les verdicts sont ensuite agrégés.
+| 
+Verdict | 
+Règle | 
+Action | 
+| 
+Confirmée | 
+Au moins 2 domaines indépendants soutiennent, aucune source plus récente ne contredit | 
+Statut sourcée, sources ajoutées | 
+| 
+Corrigée | 
+Les sources les plus récentes contredisent avec une valeur cohérente entre elles | 
+Nouvelle valeur extraite, ancienne valeur historique | 
+| 
+Complétée | 
+Confirmée, et des inconnues du cadre sont résolues | 
+Nouveaux faits ajoutés, avec span dans la source | 
+| 
+Insuffisante | 
+Pas assez de passages pertinents | 
+Une reformulation, puis file « revue humaine » | 
+| 
+Conflictuelle | 
+Les sources récentes se contredisent entre elles | 
+Revue humaine, aucune correction automatique | 
+La nouvelle valeur d'une correction est extraite du passage par le LLM local, sous contrainte de citer son span. Elle est revérifiée par NLI contre ce passage. Le LLM peut donc lire la source, jamais compléter de mémoire.
+### Étape 6 — Réécrire en base
+Mise à jour des unités et faits :
+valeur ;
+statut ;
+date de vérification ;
+URLs, dates et passages des sources.
+Propagation aux enfants selon M3 : une correction du parent vaut pour les enfants qui en héritent.
+Recalcul du taux d'obsolescence par page, au sens de ContentKB.
+## M6 — Proposer les corrections et organiser la revue humaine
+Les corrections ne portent que sur les unités qui doivent rester à jour, jamais sur celles qui ont valeur d'archive. Chaque proposition modifie le moins de texte possible, vérifie qu'elle ne perd aucune information, et se présente dans son contexte, avant et après, avec ses sources.
+### Périmètre
+Corrigées. Valeur remplacée par la valeur vérifiée.
+Périmées par date. Temps et formulation à mettre au passé, avec le bilan s'il est connu. « Sera immobilisée du 1er au 31 août » devient « a été immobilisée du… au… ».
+Complétées. Information ajoutée si elle est critique pour la page.
+Sourcées a posteriori. La phrase reste inchangée, une citation ou un lien externe est ajouté.
+Liens internes manquants. Le lien vers la page parente est ajouté (M3).
+Sont exclues les unités historique, celles qui ont le statut opinion, ainsi que les articles dont la nature est d'être daté : dépêche ou compte rendu d'un événement. Pour ces derniers, on propose une mention de mise à jour plutôt qu'une réécriture.
+### Générer la nouvelle formulation
+Substitution déterministe d'abord. Quand seul l'objet d'un fait change (date, chiffre, nom), on remplace le span de la valeur par la nouvelle valeur, au bon format, sans LLM.
+Réécriture locale ensuite. Le LLM local ne réécrit que la phrase concernée, pour les changements de temps verbal ou de structure. Il reçoit la phrase, son paragraphe, les faits à modifier et ceux à conserver.
+Contrôle de la proposition.
+La nouvelle phrase doit impliquer (NLI) chacun des faits nouveaux.
+Elle doit aussi impliquer chacun des faits conservés de l'ancienne phrase, pour éviter toute perte d'information.
+Elle doit rester dans un budget de différence, en ratio de mots changés.
+Un échec renvoie à une seconde tentative, puis la proposition est marquée « à rédiger par un humain ».
+Alternative éditoriale. Pour les contenus d'actualité, une mention datée est générée : « Mise à jour du 13 novembre 2026 : … ». Elle préserve l'intégrité de l'article d'origine.
+### Écran de revue
+L'écran s'intègre à l'interface HTML de l'outil. Il présente une proposition par carte, triée par criticité puis par page.
+| 
+Zone | 
+Contenu | 
+| 
+Contexte | 
+Le paragraphe entier, la phrase surlignée | 
+| 
+Avant / après | 
+Les deux versions côte à côte, différences marquées au mot près | 
+| 
+Motif | 
+Corrigée, périmée par date, complétée, source ajoutée ou lien interne, avec la date d'ancrage d'origine | 
+| 
+Preuves | 
+Pour chaque source : URL, domaine, date, passage exact, verdict NLI | 
+| 
+Paternité | 
+Page parente, critère décisif, autres pages du groupe touchées par la même correction | 
+| 
+Décision | 
+Accepter, modifier, rejeter, marquer comme archive (« à date du… »), reporter | 
+Propagation. Une décision sur une unité parente peut être appliquée en une fois à ses enfants.
+Export. L'export Excel par URL reprend les décisions.
+Apprentissage. Chaque décision est stockée dans proposals et sert à recalibrer les seuils : NLI, criticité, aspect humain des requêtes, budget de différence.
+## Protocole d'évaluation et points ouverts
+Les options de chaque méthodologie se départagent sur un même jeu de référence annoté, avec des seuils fixés avant les tests. Une option ne passe en production que si elle tient le seuil de qualité au coût le plus bas.
+### Jeu de référence
+Échantillon. 40 à 60 pages, réparties par type : actualité, guide pratique, analyse, fiche produit ou service, tribune. Il faut aussi au moins 5 grappes de pages qui traitent le même sujet à des dates différentes, sans quoi M3 ne peut pas être évaluée.
+Annotation.
+unités et faits attendus, avec leur span ;
+classe d'obsolescence ;
+type d'affirmation ;
+paires équivalentes, de précision ou contradictoires ;
+page parente de chaque groupe.
+Méthode d'annotation. Un premier passage par LLM tiers (option D de M1) accélère le travail. Chaque annotation est ensuite relue et corrigée à la main. C'est le seul usage récurrent d'une IA payante dans la chaîne.
+### Mesures et seuils de départ
+| 
+Méthodologie | 
+Mesure | 
+Seuil de départ à ajuster | 
+| 
+M1 unités et faits | 
+Précision : part des faits impliqués par le texte (mesure d'hallucination de type FActScore) | 
+98 % ou plus | 
+| 
+M1 unités et faits | 
+Rappel par rapport aux faits annotés | 
+80 % ou plus | 
+| 
+M1 filtrage | 
+F1 sur les classes d'obsolescence | 
+0,85 ou plus | 
+| 
+M1 déduplication | 
+Précision et rappel sur les paires | 
+0,90 et 0,80 | 
+| 
+M2 typologie | 
+F1 par type, en priorité « sans source » et « opinion » | 
+0,80 ou plus | 
+| 
+M3 paternité | 
+Part des groupes avec la bonne page parente | 
+85 % ou plus | 
+| 
+M3 contradictions | 
+Faux conflits parmi les contradictions signalées | 
+10 % ou moins | 
+| 
+M4 requêtes | 
+Note humaine à l'aveugle : « aurait pu être tapée par quelqu'un » | 
+4 sur 5 en moyenne | 
+| 
+M5 verdicts | 
+Accord avec une vérification manuelle | 
+90 % ou plus sur « confirmée » et « corrigée » | 
+| 
+M6 propositions | 
+Part acceptée sans modification en revue | 
+70 % ou plus | 
+| 
+Coût | 
+Temps local par page, tokens LLM, unités Ibou par page | 
+Suivi, plafond à fixer | 
+### Ordre de test conseillé
+Segmentation et résolution temporelle (M1, étapes 2 et 3). Tout le reste en dépend, et c'est purement déterministe.
+Unités : règles contre LLM local contre propositionizer, avec le contrôle NLI branché.
+Prédicats fermés et classes d'obsolescence.
+FCM, réduit et non réduit, comparé à HDBSCAN.
+M2 puis M3 sur les grappes.
+M4 et M5 sur un petit lot, avec les unités Ibou de test.
+M6 en revue réelle.
+### Points ouverts
+Liste fermée des prédicats. Qui la définit, et à partir de quel corpus ? Elle conditionne la déduplication, le filtrage et les gabarits de requêtes.
+Modèles entraînés surtout en anglais. Propositionizer, MiniCheck et certains NLI sont à valider en français avant adoption. Prévoir un fine-tuning léger si l'écart est trop grand.
+Seuil de « nettement plus récent » pour qualifier un remplacement plutôt qu'un conflit. Faut-il un seuil fixe, ou un seuil dépendant de la volatilité du prédicat ?
+Autorité de l'auteur. Comment établir que « l'auteur fait foi » au-delà du type de page ? Page auteur, signature, expertise déclarée.
+Politique éditoriale de correction. Réécriture ou mention de mise à jour : par type de contenu, et décidé par qui ?
+Versions des outils. Les outils cités sont des candidats à benchmarker. Leurs versions et leur support du français sont à confirmer au moment du test.

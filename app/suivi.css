@@ -1,0 +1,61 @@
+/* Barres de progression, bandeau de traitement, historique des appels, panneaux des archives */
+progress{appearance:none;-webkit-appearance:none;display:block;width:100%;height:6px;border:0;border-radius:3px;background:#e6ecef;overflow:hidden}
+progress::-webkit-progress-bar{background:#e6ecef;border-radius:3px}
+progress::-webkit-progress-value{background:var(--teal);border-radius:3px;transition:width .4s}
+progress::-moz-progress-bar{background:var(--teal);border-radius:3px}
+
+/* bandeau de traitement */
+.job-banner{position:sticky;top:0;z-index:5;box-shadow:0 4px 14px #14303a12}
+.job-banner.stopped{background:#fdf1ee;border-color:#efc9c0}
+.job-banner.finished{background:#f1f5f7;border-color:var(--line)}
+.job-banner>div{flex:1}
+.job-track{margin-top:10px}
+.job-facts{font-size:11px;color:#55706a;margin-top:8px}
+.job-facts b{color:var(--ink);font-weight:600}
+.job-trail{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px;font-size:10px;color:#7b8f89}
+.job-trail span{border:1px solid #cfe1d9;border-radius:10px;padding:1px 9px;background:#ffffff90}
+.job-trail span.now{background:var(--teal);border-color:var(--teal);color:white}
+.job-trail i{font-style:normal;color:#a9bab4}
+
+/* panneau de surveillance : n'apparaît que s'il y a quelque chose à lire */
+.watch-compact{padding:16px 24px;margin:0 0 20px}
+.watch-compact>h2{font-size:14px;letter-spacing:0;margin-bottom:6px}
+.watch-compact p{margin:3px 0}
+.watch-compact .notice{margin:10px 0 0}
+
+/* parcours */
+
+/* à faire */
+.step-panels{margin-bottom:24px;padding:0}
+.step-panels>summary{cursor:pointer;padding:16px 24px;font-size:12px;font-weight:600;list-style-position:inside}
+.step-panels>summary small{font-weight:400;color:var(--muted);margin-left:8px}
+
+/* requêtes Ibou */
+
+/* historique */
+#view-history .toolbar .search{margin:0}
+.badge.call-success,.badge.run-completed{background:#e6f4ec;color:#32815d}
+.badge.call-cache{background:#eaf1f7;color:#527a98}
+.badge.call-error,.badge.call-uncertain,.badge.run-error,.badge.run-interrupted{background:#fbe9e6;color:#a4493a}
+.badge.call-refused,.badge.run-paused{background:#fcf0dd;color:#a46b19}
+.badge.run-running{background:var(--teal);color:white}
+.badge.not_needed{background:#f2f5f7;color:#647381}
+.log-facts{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;font-size:11px;color:#5d6e7b;margin:14px 0}
+.log-body{background:#f6f8fa;border:1px solid var(--line);border-radius:6px;padding:13px;font:11px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;margin:0}
+.log-line{cursor:pointer;padding:11px 14px;margin:8px 0}
+.log-line:hover{background:#f8fbfa}
+#log-dialog{width:min(900px,calc(100% - 32px))}
+
+
+/* densité : l'essentiel visible sans défiler */
+header{height:50px}
+.page{padding-top:18px}
+.page-heading{margin-bottom:14px}
+.page-heading .eyebrow,#page-subtitle{display:none}
+#page-title{font-size:20px;letter-spacing:-.4px;margin:0}
+.job-banner{padding:10px 16px;margin-bottom:14px}
+.job-track{margin-top:6px}
+.job-facts,.job-trail{margin-top:5px}
+#job-message{line-height:1.4}
+#job-progress{margin-top:2px;line-height:1.4}
+#view-overview .metric-icon{display:none}
